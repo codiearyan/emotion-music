@@ -18,6 +18,9 @@ tf-keras  # Keras compatibility for transformers
 # Music playback
 pygame
 
+# Streamlit web/desktop UI
+streamlit
+
 # Optional: music metadata
 mutagen
 

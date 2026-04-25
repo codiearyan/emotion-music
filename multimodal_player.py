@@ -16,6 +16,13 @@ from src.music_analysis.music_emotion_recognition import MusicEmotionAnalyzer
 from src.recommendation.recommendation_engine import MusicRecommendationEngine
 import pygame
 import time
+import tempfile
+import urllib.parse
+import urllib.request
+import json
+import shutil
+import subprocess
+
 
 class MultimodalMusicPlayer:
     def __init__(self):
@@ -43,6 +50,8 @@ class MultimodalMusicPlayer:
             print("   Switching to dummy audio driver for simulation.")
             os.environ["SDL_AUDIODRIVER"] = "dummy"
             pygame.mixer.init()
+        pygame.font.init()
+        pygame.display.init()
         
         print("✅ All systems ready!\n")
         
@@ -115,50 +124,110 @@ class MultimodalMusicPlayer:
         
         return detected_emotion, song
         
-    def play_music(self, song_name, detected_emotion):
-        """Play the recommended song"""
-        if not song_name:
-            print("⚠️  No song available")
-            return
-            
-        song_path = f'songs/{song_name}.mp3'
-        
-        if not os.path.exists(song_path):
-            print(f"⚠️  Song file not found: {song_path}")
-            return
-            
+    def fetch_preview_url(self, query):
+        q = urllib.parse.quote(query)
+        try:
+            with urllib.request.urlopen(f"https://itunes.apple.com/search?term={q}&media=music&limit=1", timeout=8) as r:
+                data = json.loads(r.read())
+            if data.get("results"):
+                track = data["results"][0]
+                if track.get("previewUrl"):
+                    return track["previewUrl"], f'{track["artistName"]} - {track["trackName"]}'
+        except Exception as e:
+            print(f"   iTunes lookup failed: {e}")
+
+        try:
+            with urllib.request.urlopen(f"https://api.deezer.com/search?q={q}&limit=1", timeout=8) as r:
+                data = json.loads(r.read())
+            if data.get("data"):
+                track = data["data"][0]
+                if track.get("preview"):
+                    return track["preview"], f'{track["artist"]["name"]} - {track["title"]}'
+        except Exception as e:
+            print(f"   Deezer lookup failed: {e}")
+
+        return None, None
+
+    def download_preview(self, url):
+        path = urllib.parse.urlparse(url).path.lower()
+        is_aac = path.endswith(".m4a") or path.endswith(".aac")
+        suffix = ".m4a" if is_aac else ".mp3"
+
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                tmp.write(r.read())
+            tmp.close()
+        except Exception as e:
+            tmp.close()
+            os.unlink(tmp.name)
+            raise e
+
+        if not is_aac:
+            return tmp.name
+
+        if not shutil.which("ffmpeg"):
+            print("   ⚠️  ffmpeg not found — install with `brew install ffmpeg` for iTunes previews.")
+            os.unlink(tmp.name)
+            return None
+
+        mp3_path = tmp.name.replace(".m4a", ".mp3")
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", tmp.name,
+                 "-codec:a", "libmp3lame", "-qscale:a", "2", mp3_path],
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"   ⚠️  ffmpeg conversion failed: {e}")
+            os.unlink(tmp.name)
+            return None
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
+        return mp3_path
+
+    EMOJI_MAP = {'angry': '😠', 'happy': '😊', 'neutral': '😐', 'sad': '😢'}
+
+    def _play_one(self, query, detected_emotion, screen, font, emoji_font, position_text=""):
+        print(f"\n🔎 Searching online for: {query}")
+        preview_url, resolved_name = self.fetch_preview_url(query)
+        if not preview_url:
+            print(f"⚠️  No preview found for: {query}")
+            return "skip"
+
+        print(f"   ✓ Found: {resolved_name}")
+
+        try:
+            song_path = self.download_preview(preview_url)
+        except Exception as e:
+            print(f"⚠️  Failed to download preview: {e}")
+            return "skip"
+        if not song_path:
+            return "skip"
+
+        display_name = resolved_name or query
+        action = "finished"
+
         try:
             pygame.mixer.music.load(song_path)
-            print(f"\n🎵 Now Playing: {song_name}")
-            print("\n" + "="*60)
-            print("Controls: P=Pause, R=Resume, S=Stop, Q=Quit")
-            print("="*60 + "\n")
-            
+            print(f"\n🎵 Now Playing: {display_name}")
             pygame.mixer.music.play()
-            
-            # Create simple control window
-            screen = pygame.display.set_mode((600, 400))
-            pygame.display.set_caption(f"SyncIn Player - {detected_emotion.title()}")
+            pygame.time.wait(300)
+
             clock = pygame.time.Clock()
-            font = pygame.font.Font(None, 36)
-            emoji_font = pygame.font.SysFont("segoeuiemoji", 100) # Try to use a font that supports emojis
-            
-            # Emoji mapping
-            emoji_dict = {
-                'angry': '😠', 
-                'happy': '😊', 
-                'neutral': '😐', 
-                'sad': '😢'
-            }
-            emoji_char = emoji_dict.get(detected_emotion, '😐')
-            
-            running = True
+            emoji_char = self.EMOJI_MAP.get(detected_emotion, '😐')
             paused = False
-            
-            while running and pygame.mixer.music.get_busy():
+
+            while pygame.mixer.music.get_busy() or paused:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
-                        running = False
+                        action = "quit"
+                        pygame.mixer.music.stop()
+                        break
                     elif event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_p:
                             pygame.mixer.music.pause()
@@ -168,85 +237,133 @@ class MultimodalMusicPlayer:
                             pygame.mixer.music.unpause()
                             paused = False
                             print("▶️  Resumed")
-                        elif event.key == pygame.K_s:
+                        elif event.key == pygame.K_n:
+                            action = "next"
                             pygame.mixer.music.stop()
-                            print("⏹️  Stopped")
-                        elif event.key == pygame.K_q:
-                            running = False
-                            
-                # Draw
+                            print("⏭️  Next")
+                            break
+                        elif event.key in (pygame.K_q, pygame.K_s):
+                            action = "quit"
+                            pygame.mixer.music.stop()
+                            break
+
+                if action != "finished":
+                    break
+
                 screen.fill((30, 30, 40))
-                
-                # Display Emoji (or fallback text if font fails)
                 try:
                     emoji_surface = emoji_font.render(emoji_char, True, (255, 255, 255))
-                    # Center the emoji
-                    emoji_rect = emoji_surface.get_rect(center=(300, 150))
-                    screen.blit(emoji_surface, emoji_rect)
-                except:
-                    # Fallback if emoji rendering fails
-                    emoji_text = font.render(f"Emotion: {detected_emotion.title()}", True, (255, 200, 100))
-                    screen.blit(emoji_text, (50, 150))
+                    screen.blit(emoji_surface, emoji_surface.get_rect(center=(300, 130)))
+                except Exception:
+                    fallback = font.render(f"Emotion: {detected_emotion.title()}", True, (255, 200, 100))
+                    screen.blit(fallback, (50, 130))
 
-                # Song name
-                song_text = font.render(f"Song: {song_name}", True, (255, 255, 255))
-                song_rect = song_text.get_rect(center=(300, 250))
-                screen.blit(song_text, song_rect)
-                
-                # Status
+                song_text = font.render(f"{display_name[:48]}", True, (255, 255, 255))
+                screen.blit(song_text, song_text.get_rect(center=(300, 240)))
+
+                if position_text:
+                    pos = font.render(position_text, True, (180, 180, 180))
+                    screen.blit(pos, pos.get_rect(center=(300, 280)))
+
                 status = "PAUSED" if paused else "PLAYING"
                 status_color = (255, 200, 100) if paused else (100, 255, 100)
                 status_text = font.render(status, True, status_color)
-                status_rect = status_text.get_rect(center=(300, 320))
-                screen.blit(status_text, status_rect)
-                
-                # Controls hint
-                hint_text = font.render("P: Pause | R: Resume | S: Stop | Q: Quit", True, (150, 150, 150))
-                hint_rect = hint_text.get_rect(center=(300, 370))
-                # Scale down hint text
-                hint_text = pygame.transform.scale(hint_text, (int(hint_rect.width * 0.7), int(hint_rect.height * 0.7)))
-                hint_rect = hint_text.get_rect(center=(300, 370))
-                screen.blit(hint_text, hint_rect)
-                
+                screen.blit(status_text, status_text.get_rect(center=(300, 320)))
+
+                hint = font.render("P:Pause  R:Resume  N:Next  Q:Quit", True, (150, 150, 150))
+                hint = pygame.transform.scale(hint, (int(hint.get_width() * 0.7), int(hint.get_height() * 0.7)))
+                screen.blit(hint, hint.get_rect(center=(300, 370)))
+
                 pygame.display.flip()
                 clock.tick(30)
-                
-            pygame.mixer.music.stop()
-            pygame.quit()
-            print("\n✅ Playback finished")
-            
+
         except Exception as e:
             print(f"⚠️  Error playing music: {e}")
+        finally:
+            try:
+                os.unlink(song_path)
+            except Exception:
+                pass
+
+        return action
+
+    def play_queue(self, queries, detected_emotion):
+        if not queries:
+            print("⚠️  Queue is empty")
+            return
+
+        screen = pygame.display.set_mode((600, 400))
+        pygame.display.set_caption(f"SyncIn Player - {detected_emotion.title()}")
+        font = pygame.font.Font(None, 32)
+        emoji_font = pygame.font.SysFont("segoeuiemoji", 100)
+
+        print("\n" + "="*60)
+        print(f"Playing queue ({len(queries)} tracks)")
+        print("Controls: P=Pause  R=Resume  N=Next  Q=Quit")
+        print("="*60)
+
+        for idx, query in enumerate(queries, start=1):
+            position = f"Track {idx} / {len(queries)}"
+            action = self._play_one(query, detected_emotion, screen, font, emoji_font, position)
+            if action == "quit":
+                break
+
+        pygame.mixer.music.stop()
+        pygame.quit()
+        print("\n✅ Playback finished")
             
-    def run(self):
-        """Main application loop"""
+    def choose_mode(self):
         print("\n" + "="*60)
         print("🎵 MULTIMODAL EMOTION-BASED MUSIC PLAYER")
         print("="*60)
-        print("\nThis system detects your emotions from multiple sources:")
-        print("  📹 Facial expressions (webcam)")
-        print("  🎤 Voice/audio (microphone)")
-        print("  💬 Text input (optional)")
-        print("\nThen recommends and plays music matching your mood!\n")
-        
-        input("Press Enter to start...")
-        
-        # Detect emotions from all modalities
+        print("\nWhat would you like to play?")
+        print("  1) Emotion-recommended song (default)")
+        print("  2) Search a specific song")
+        print("  3) Manual playlist (paste song names)")
+        choice = input("\nChoose [1/2/3] (default 1): ").strip() or "1"
+
+        if choice == "2":
+            query = input("Song name: ").strip()
+            return ("search", [query]) if query else ("emotion", None)
+
+        if choice == "3":
+            print("Enter song names, one per line. Blank line to finish.")
+            print("Tip: 'Artist - Title' gives best matches.")
+            queue = []
+            while True:
+                line = input(f"  {len(queue)+1}> ").strip()
+                if not line:
+                    break
+                queue.append(line)
+            if not queue:
+                return ("emotion", None)
+            print(f"   ✓ Queue has {len(queue)} tracks")
+            return ("manual", queue)
+
+        return ("emotion", None)
+
+    def run(self):
+        """Main application loop"""
+        mode, queue = self.choose_mode()
+
+        input("\nPress Enter to start emotion detection...")
+
         facial_probs, audio_probs, text_probs = self.detect_emotions(
-            use_facial=True,
-            use_audio=True,
-            use_text=True
+            use_facial=True, use_audio=True, use_text=True
         )
-        
-        # Fuse and get recommendation
-        detected_emotion, song = self.fuse_and_recommend(facial_probs, audio_probs, text_probs)
-        
-        # Play music
-        if song:
-            self.play_music(song, detected_emotion)
+
+        detected_emotion, recommended_song = self.fuse_and_recommend(
+            facial_probs, audio_probs, text_probs
+        )
+
+        if mode == "emotion":
+            queue = [recommended_song] if recommended_song else []
+
+        if not queue:
+            print("⚠️  Nothing to play")
         else:
-            print("⚠️  Could not find a suitable song")
-            
+            self.play_queue(queue, detected_emotion)
+
         print("\n👋 Thank you for using the Multimodal Music Player!")
 
 def main():
